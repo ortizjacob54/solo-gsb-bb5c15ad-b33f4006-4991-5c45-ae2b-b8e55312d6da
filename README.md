@@ -75,6 +75,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/jobs/{job_id}/files` | 仅获取逐文件诊断与变更列表 |
 | `GET` | `/jobs/{job_id}/download` | 下载匿名化后的 ZIP（全量） |
 | `GET` | `/jobs/{job_id}/studies/{study_instance_uid}/download` | 按**匿名 StudyInstanceUID** 下载检查子集（递归补全 SOP 引用闭包，含跨检查引用） |
+| `GET` | `/jobs/{job_id}/dicomdir/download` | 下载含 **DICOMDIR** 的离线阅片文件集 ZIP（按患者伪名与匿名 Study/Series/SOP UID 重建四级目录，实例映射为合规短路径） |
 | `GET` | `/health` | 健康检查 |
 
 ### 表单参数（`POST /jobs`）
@@ -194,6 +195,89 @@ else:
 > 注意：匿名化时的悬空引用（`DANGLING_REFERENCE` 警告）会使引用闭包无法在本任务
 > 输出内闭合，因此含此类引用的检查子集下载会返回 `409`；请改全量下载
 > `GET /jobs/{id}/download`（行为不变），或在上传前补齐被引用实例。
+
+### 下载含 DICOMDIR 的离线阅片文件集（`GET /jobs/{job_id}/dicomdir/download`）
+
+需要把匿名结果导入**离线阅片软件 / 刻录介质**（依赖 DICOM File-set 与
+`DICOMDIR` 索引浏览）时，本接口从已完成任务的匿名输出生成一个 ZIP 文件集：
+
+1. 从每份匿名文件读取**患者伪名**（`PatientID` / `PatientName`）与匿名
+   **Study / Series / SOP Instance UID**，重建
+   `PATIENT → STUDY → SERIES → 实例` 四级目录记录层次；
+2. 每个实例映射为一个**符合 DICOM File ID 约束**（每段 ≤ 8 字符、至多 8 段、
+   仅允许 `0-9`/`A-Z`/`_`）的**稳定短路径**，形如
+   `PT000000/ST000000/SE000000/IM000000`（RT 结构集等叶子类型前缀相应为
+   `RS…`）；路径顺序由（伪名、匿名 Study/Series/SOP UID）排序决定，
+   **同一任务重复下载路径完全一致**；
+3. ZIP 根目录即 File-set 根：包含一份 `DICOMDIR` 与上述短路径实例文件。
+   叶子记录的 `ReferencedFileID` 由 pydicom FileSet 写入并逐个核对，
+   **必定指向 ZIP 内实际打包的文件**；目录记录只引用匿名文件中的字段
+   （检查日期/时间、Modality 等已随匿名化平移或清空），**不会带入原始路径、
+   原始文件名或任何身份字段**。
+
+文件集**只复用任务 output 目录中的匿名 DICOM 文件**（经 FileSet 以原传输语法
+重编码写入短路径），不会重新解压或处理原始 ZIP。
+
+```bash
+# 5) 下载含 DICOMDIR 的离线阅片文件集
+curl -OJ -D dicomdir.headers \
+  "http://localhost:8000/jobs/$JOB_ID/dicomdir/download"
+grep -i '^x-dicomdir-' dicomdir.headers
+# x-dicomdir-file-count: 4
+
+unzip -l dicomdir-*.zip
+# DICOMDIR
+# PT000000/ST000000/SE000000/IM000000
+# PT000000/ST000000/SE000000/IM000001
+# PT000001/ST000000/SE000000/IM000000
+# PT000001/ST000000/SE000001/RS000000
+```
+
+| 响应头 | 含义 |
+| --- | --- |
+| `X-Dicomdir-File-Count` | 文件集内的实例（叶子记录）数量（不含 DICOMDIR 本身） |
+
+**拒绝残缺目录包**：只要出现以下任一情况，接口返回 `409`，并在
+`detail.problems[]` 中**一次性列明全部问题文件及原因**，不产生 ZIP：
+
+- `unreadable`：匿名输出文件不可读或内容损坏（`output_file` + `message`）；
+- `missing_required_tag`：缺少建目录必需标签（`missing_tags` 给出标签号与名称：
+  患者伪名 `PatientID`/`PatientName`、`Study/Series/SOPInstanceUID`、
+  `SOPClassUID`、`Modality` 或文件元信息 `MediaStorageSOPClassUID`/
+  `TransferSyntaxUID`）；
+- `ambiguous_sop`：同一匿名 SOPInstanceUID 对应多份输出文件（输入 ZIP 内
+  重复实例被改名输出为 `<uid>.dcm` / `<uid>-2.dcm`），`output_files`
+  列出相互冲突的扁平文件名。
+
+任务不存在或已过期返回 `404`；任务未完成（`status != ready`）返回 `409`
+（`JOB_NOT_READY`）。叶子记录类型专属的说明性标签（如 `InstanceNumber`、
+RT 结构集的 `StructureSetLabel`）多为 Type 2 可选键，缺失时不阻断构建，
+仅在目录记录中省略该字段。
+
+```jsonc
+// 409 响应示例
+{
+  "detail": {
+    "code": "DICOMDIR_BUILD_INVALID",
+    "message": "匿名输出存在不可读文件、缺少建目录必需标签或 SOP UID 歧义，已拒绝输出 DICOMDIR 文件集 ZIP",
+    "problems": [
+      {"output_file": "2.25.1383….dcm",
+       "sop_instance_uid": "2.25.1383…",
+       "reason": "missing_required_tag",
+       "missing_tags": ["(0008,0060) Modality"],
+       "message": "匿名输出缺少构建 DICOMDIR 必需的标签：(0008,0060) Modality"},
+      {"output_file": "",
+       "sop_instance_uid": "2.25.1613…",
+       "reason": "ambiguous_sop",
+       "missing_tags": [],
+       "output_files": ["2.25.1613….dcm", "2.25.1613…-2.dcm"],
+       "message": "同一匿名 SOPInstanceUID 对应多份输出文件，无法唯一确定 DICOMDIR 记录引用"}
+    ]
+  }
+}
+```
+
+> 注意：文件集 ZIP 为一次性临时文件，响应结束后即从磁盘删除。
 
 ### 跨任务合并下载同一匿名检查（`POST /jobs/merged-study/download`）
 
@@ -733,8 +817,9 @@ else:
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、/health）
+│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集/DICOMDIR 文件集下载、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
+│   ├── dicomdir.py      # DICOMDIR 文件集：四级目录重建、File ID 稳定短路径、缺标签/歧义 409（复用匿名输出 + pydicom FileSet）
 │   ├── study_subset.py  # 按匿名 StudyInstanceUID 的引用闭包解析与子集 ZIP（复用匿名输出）
 │   ├── merged_study.py  # 跨 2～5 个同密钥任务的检查合并：跨任务引用闭包、字节去重/冲突/缺失 409
 │   ├── consistency.py   # 跨任务一致性核对：密钥指纹/患者伪名/UID 映射比对与差异明细分页
@@ -742,9 +827,9 @@ else:
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并下载错误模型）
+│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR 错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并（127 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR（141 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

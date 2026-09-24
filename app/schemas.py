@@ -432,3 +432,36 @@ class MergedStudyErrorDetail(BaseModel):
         default=[],
         description="引用目标在所有指定任务成功输出中均不存在的匿名 UID 列表",
     )
+
+
+# --------------------------------------------------------------------------- #
+# DICOMDIR 文件集下载（GET /jobs/{id}/dicomdir/download）
+# --------------------------------------------------------------------------- #
+class DicomDirProblemItem(BaseModel):
+    output_file: str = Field(
+        description="出问题的扁平匿名输出文件名；SOP 歧义问题时为空字符串（见 output_files）"
+    )
+    sop_instance_uid: str = Field(description="该匿名输出对应的匿名 SOPInstanceUID")
+    reason: str = Field(
+        description="unreadable（匿名输出文件不可读/损坏） | "
+        "missing_required_tag（缺少构建 DICOMDIR 必需标签） | "
+        "ambiguous_sop（同一匿名 SOP UID 对应多份输出文件）"
+    )
+    missing_tags: list[str] = Field(
+        default=[],
+        description="missing_required_tag 时给出缺失的必需标签（含 DICOM 标签号与名称）",
+    )
+    output_files: list[str] = Field(
+        default=[], description="ambiguous_sop 时给出相互冲突的扁平输出文件名"
+    )
+    message: str
+
+
+class DicomDirErrorDetail(BaseModel):
+    code: str = Field(
+        description="JOB_NOT_READY（409） | DICOMDIR_NO_USABLE_OUTPUT（409） | "
+        "DICOMDIR_BUILD_INVALID（409） | DICOMDIR_FILE_ID_INVALID（500） | "
+        "DICOMDIR_REFERENCED_FILE_MISSING（500）"
+    )
+    message: str
+    problems: list[DicomDirProblemItem] = []

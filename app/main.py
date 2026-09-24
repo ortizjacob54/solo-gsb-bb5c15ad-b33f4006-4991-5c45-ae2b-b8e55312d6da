@@ -12,7 +12,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.responses import FileResponse
 
 from .anonymizer import JobResult
-from . import consistency, merged_study, pagination, study_subset
+from . import consistency, dicomdir, merged_study, pagination, study_subset
 from .config import settings
 from .jobs import registry
 from .schemas import (
@@ -21,6 +21,7 @@ from .schemas import (
     ConsistencyDifferenceItem,
     ConsistencyErrorDetail,
     CursorErrorDetail,
+    DicomDirErrorDetail,
     FileOut,
     JobOut,
     MergedStudyDownloadRequest,
@@ -47,7 +48,8 @@ app = FastAPI(
         "上传影像 ZIP，使用用户提供的稳定密钥生成患者级伪名，重写 "
         "Patient/Study/Series/SOP/FrameOfReference UID 与身份字段，"
         "递归更新序列内引用并保持检查关系。提供标签变更预览与匿名化 ZIP 下载，"
-        "支持按匿名检查下载子集、跨多个同密钥任务合并下载同一检查，"
+        "支持按匿名检查下载子集、跨多个同密钥任务合并下载同一检查、"
+        "生成供离线阅片软件浏览的 DICOMDIR 文件集，"
         "并支持对多个已完成任务做跨批次密钥指纹/伪名/UID 映射一致性核对。"
     ),
     lifespan=lifespan,
@@ -557,6 +559,50 @@ def _safe_unlink(path: str) -> None:
         pass
 
 
+@app.get(
+    "/jobs/{job_id}/dicomdir/download",
+    tags=["jobs"],
+    summary="下载含 DICOMDIR 的离线阅片文件集 ZIP（按伪名/匿名 UID 重建四级目录）",
+    responses={
+        404: {"description": "任务不存在或已过期"},
+        409: {"model": DicomDirErrorDetail,
+              "description": "任务未完成、无可用匿名输出，或匿名输出不可读 / 缺少建目录"
+                             "必需标签 / 同一 SOP UID 对应多份输出"},
+    },
+)
+def download_dicomdir(job_id: str, background_tasks: BackgroundTasks):
+    job = registry.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    if job.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOB_NOT_READY",
+                "message": f"任务处理失败：{job.error}",
+            },
+        )
+
+    try:
+        zip_path, instance_count = dicomdir.write_dicomdir_zip(
+            job, settings.work_dir
+        )
+    except dicomdir.DicomDirError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.detail) from exc
+
+    background_tasks.add_task(_safe_unlink, zip_path)
+    name = f"dicomdir-{job.id[:8]}.zip"
+    headers = {
+        "X-Dicomdir-File-Count": str(instance_count),
+    }
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=name,
+        headers=headers,
+    )
+
+
 @app.get("/", include_in_schema=False)
 def root() -> dict:
     return {
@@ -571,6 +617,7 @@ def root() -> dict:
             "GET /jobs/{job_id}/files",
             "GET /jobs/{job_id}/download",
             "GET /jobs/{job_id}/studies/{study_instance_uid}/download",
+            "GET /jobs/{job_id}/dicomdir/download",
             "GET /health",
         ],
     }
