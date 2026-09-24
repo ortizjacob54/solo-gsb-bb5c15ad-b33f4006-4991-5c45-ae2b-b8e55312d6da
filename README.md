@@ -74,6 +74,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/jobs/{job_id}` | 获取任务结果（预览 + 诊断 + UID 映射概览） |
 | `GET` | `/jobs/{job_id}/files` | 仅获取逐文件诊断与变更列表 |
 | `GET` | `/jobs/{job_id}/download` | 下载匿名化后的 ZIP（全量） |
+| `GET` | `/jobs/{job_id}/dicomdir/download` | 下载带 **DICOMDIR** 的离线阅片 ZIP：按匿名伪名 / Study/Series/SOP UID 重建四级目录层级，实例映射为合规稳定短 File ID |
 | `GET` | `/jobs/{job_id}/studies/{study_instance_uid}/download` | 按**匿名 StudyInstanceUID** 下载检查子集（递归补全 SOP 引用闭包，含跨检查引用） |
 | `GET` | `/health` | 健康检查 |
 
@@ -194,6 +195,81 @@ else:
 > 注意：匿名化时的悬空引用（`DANGLING_REFERENCE` 警告）会使引用闭包无法在本任务
 > 输出内闭合，因此含此类引用的检查子集下载会返回 `409`；请改全量下载
 > `GET /jobs/{id}/download`（行为不变），或在上传前补齐被引用实例。
+
+### 下载带 DICOMDIR 的离线阅片 ZIP（`GET /jobs/{job_id}/dicomdir/download`）
+
+需要把匿名结果导入仅支持**介质存储浏览**（DICOMDIR）的离线阅片软件时，可用本接口
+取回一个根目录含 `DICOMDIR` 的 ZIP。构建**只读取已完成任务 output 目录中的匿名
+DICOM 文件**，不重新解压或处理原始 ZIP：
+
+1. 逐个读取匿名输出，按文件**自身标签**重建
+   `患者（PatientID/PatientName 伪名）→ 检查（StudyInstanceUID）→
+   系列（SeriesInstanceUID）→ 实例（SOPInstanceUID）` 四级层级；
+2. 每个实例被映射为符合 DICOM File ID 约束（每组件 ≤ 8 字符、大写字母数字、
+   最多 8 级）的**稳定短路径**，形如 `PT000000/ST000000/SExxxxxx/IMxxxxxx`
+   （RT 结构集等为 `RSxxxxxx`）；同一任务的同一批输出按
+   患者伪名 ID → Study/Series/SOP UID 的固定键排序编号，**重复请求得到相同路径**；
+3. DICOMDIR 叶级记录的 `ReferencedFileID` 必须指向 ZIP 内**实际存在**的文件，
+   写出后会重新加载逐条校验，实例文件与全量匿名包内文件**逐字节相同**；
+4. ZIP 内**只含匿名伪名与匿名 UID**：不带入任何原始目录结构、原始文件名、
+   患者真实身份字段。
+
+```bash
+# 5) 下载离线阅片包（解压后根目录即 DICOMDIR，可直接被阅片软件作为介质打开）
+curl -OJ -D dicomdir.headers \
+  "http://localhost:8000/jobs/$JOB_ID/dicomdir/download"
+grep -i '^x-dicomdir-' dicomdir.headers
+# x-dicomdir-file-count: 4
+# x-dicomdir-patient-count: 2
+# x-dicomdir-study-count: 2
+# x-dicomdir-series-count: 3
+
+unzip -l dicomdir-*.zip
+# DICOMDIR
+# PT000000/ST000000/SE000000/IM000000
+# PT000000/ST000000/SE000000/IM000001
+# PT000001/ST000000/SE000001/RS000000
+```
+
+建目录必需的标签：患者伪名 `PatientID` / `PatientName`、
+`StudyInstanceUID` / `SeriesInstanceUID` / `SOPInstanceUID`、`SOPClassUID`、
+文件元信息 `TransferSyntaxUID`、以及系列级 `Modality`。其余描述字段
+（`StudyDate` / `SeriesNumber` / `InstanceNumber` 等）存在且非空时带入目录记录，
+缺失不影响建目录（目录不会为其合成值）。
+
+出现以下任一情况时接口**不产生残缺 ZIP**，而是返回 `409`
+（`detail.code = DICOMDIR_BUILD_INCOMPLETE`），在 `detail.problems[]` 中
+**一次性列出全部问题文件及原因**：
+
+| `reason` | 触发条件 |
+| --- | --- |
+| `unreadable` | 匿名输出文件存在但无法作为 DICOM 读取（损坏 / 截断 / 编码错误） |
+| `missing_required_tags` | 缺少建立目录必需的标签（`missing_tags` 给出标签关键字列表） |
+| `ambiguous_output` | 同一匿名 SOPInstanceUID 对应多份输出文件（`output_files` 给出冲突文件名），无法分配唯一 File ID |
+| `output_missing` | 任务记录中有该输出，但磁盘文件已不存在 |
+
+任务不存在 / 已过期返回 `404`；任务未完成（`status != ready`）返回 `409`
+（`JOB_NOT_READY`）；任务没有任何成功匿名输出时返回 `409`
+（`NO_ANONYMIZED_OUTPUT`）。全量下载 `GET /jobs/{id}/download` 不受这些限制影响。
+
+Python 示例（含 409 处理）：
+
+```python
+resp = requests.get(f"http://localhost:8000/jobs/{job_id}/dicomdir/download")
+if resp.status_code == 409:
+    detail = resp.json()["detail"]
+    print("拒绝输出目录包：", detail["code"])
+    for p in detail.get("problems", []):
+        # p["reason"]: unreadable | missing_required_tags
+        #            | ambiguous_output | output_missing
+        print(p["output_file"], p["reason"], p.get("missing_tags"),
+              p.get("output_files"))
+else:
+    resp.raise_for_status()
+    print("患者：", resp.headers["X-Dicomdir-Patient-Count"],
+          "实例：", resp.headers["X-Dicomdir-File-Count"])
+    open("dicomdir.zip", "wb").write(resp.content)
+```
 
 ### 跨任务合并下载同一匿名检查（`POST /jobs/merged-study/download`）
 
@@ -735,6 +811,7 @@ else:
 ├── app/
 │   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
+│   ├── dicomdir.py      # 从匿名输出重建 DICOMDIR 四级层级、稳定短 File ID、引用校验与阅片 ZIP
 │   ├── study_subset.py  # 按匿名 StudyInstanceUID 的引用闭包解析与子集 ZIP（复用匿名输出）
 │   ├── merged_study.py  # 跨 2～5 个同密钥任务的检查合并：跨任务引用闭包、字节去重/冲突/缺失 409
 │   ├── consistency.py   # 跨任务一致性核对：密钥指纹/患者伪名/UID 映射比对与差异明细分页
@@ -742,9 +819,9 @@ else:
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并下载错误模型）
+│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR 下载错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并（127 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR（144 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

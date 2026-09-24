@@ -353,6 +353,41 @@ class StudySubsetErrorDetail(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# DICOMDIR 离线阅片包下载（GET /jobs/{id}/dicomdir/download）
+# --------------------------------------------------------------------------- #
+class DicomDirProblemItem(BaseModel):
+    output_file: str = Field(
+        description="出问题的扁平匿名输出文件名（任务 output 目录内的文件名）"
+    )
+    sop_instance_uid: Optional[str] = Field(
+        default=None, description="可读取时给出文件内的匿名 SOPInstanceUID"
+    )
+    reason: str = Field(
+        description="unreadable（匿名输出不可读/不是合法 DICOM） | "
+        "missing_required_tags（缺少建立 DICOMDIR 必需标签） | "
+        "ambiguous_output（同一匿名 SOP UID 对应多份输出） | "
+        "output_missing（匿名输出文件在任务目录中不存在）"
+    )
+    missing_tags: list[str] = Field(
+        default=[], description="reason=missing_required_tags 时给出缺失的标签关键字"
+    )
+    output_files: list[str] = Field(
+        default=[], description="reason=ambiguous_output 时给出相互冲突的输出文件名"
+    )
+    message: str
+
+
+class DicomDirErrorDetail(BaseModel):
+    code: str = Field(
+        description="JOB_NOT_READY（409） | NO_ANONYMIZED_OUTPUT（409） | "
+        "DICOMDIR_BUILD_INCOMPLETE（409） | "
+        "DICOMDIR_WRITE_FAILED / DICOMDIR_REFERENCE_MISSING（500）"
+    )
+    message: str
+    problems: list[DicomDirProblemItem] = []
+
+
+# --------------------------------------------------------------------------- #
 # 跨任务合并下载单个匿名检查（POST /jobs/merged-study/download）
 # --------------------------------------------------------------------------- #
 class MergedStudyDownloadRequest(BaseModel):
